@@ -1,0 +1,121 @@
+From bf964305bbb66e1ac9c286cf058b3bb0a1ff0b1e Mon Sep 17 00:00:00 2001
+From: llm-pt-ibm <llm-pt-ibm@ufcg.edu.br>
+Date: Thu, 6 Aug 2026 19:29:49 +0000
+Subject: [PATCH 2/5] mlas: vectorize the POWER SQ4BitGemmM1 kernel with VSX
+
+Unpack 16 nibbles at a time: interleaving the low/high nibble vectors with
+vec_mergeh yields the 16 values in order, then zero-extend uchar->ushort->uint
+by merging with zeros (little endian) and vec_ctf to float. The block scale is
+constant, so accumulate sum(A * (v - zp)) in a vector accumulator and scale
+once per block.
+
+MatMulNBits M=1 K=3072 N=8192 on POWER9, peak over thread counts:
+  no kernel (ComputeBUnpacked fallback)    3.2 GFLOP/s
+  scalar kernel                           18.4 GFLOP/s
+  this                                    52.6 GFLOP/s
+
+Phi-3-mini int4 end-to-end decoding: 0.51 -> 7.30 tok/s (14.3x), and 56x
+against the stock default thread count. int4 is now within 2-3.7x of fp32,
+down from 25-45x.
+
+Correctness unchanged: 23/23 against the NumPy reference, 17/17 numerics,
+89/89 onnxruntime-genai unit tests.
+---
+ .../lib/power/sqnbitgemm_kernel_power.cpp     | 67 ++++++++++++++++++-
+ 1 file changed, 65 insertions(+), 2 deletions(-)
+
+diff --git a/onnxruntime/core/mlas/lib/power/sqnbitgemm_kernel_power.cpp b/onnxruntime/core/mlas/lib/power/sqnbitgemm_kernel_power.cpp
+index d25794a..a345102 100644
+--- a/onnxruntime/core/mlas/lib/power/sqnbitgemm_kernel_power.cpp
++++ b/onnxruntime/core/mlas/lib/power/sqnbitgemm_kernel_power.cpp
+@@ -26,8 +26,11 @@ Abstract:
+ 
+ --*/
+ 
++#include <altivec.h>
++
+ #include <algorithm>
+ #include <cassert>
++#include <cstdint>
+ #include <cstring>
+ 
+ #include "qnbitgemm.h"
+@@ -40,6 +43,44 @@ namespace
+ 
+ constexpr size_t BlkBitWidth = 4;
+ 
++// <altivec.h> defines `vector`, `bool` and `pixel` as keywords; use the
++// underscore-prefixed spellings so this stays valid C++.
++typedef __vector float VFloat;
++typedef __vector unsigned char VUChar;
++typedef __vector unsigned short VUShort;
++typedef __vector unsigned int VUInt;
++
++//
++// Dequantize 16 consecutive 4-bit values (8 bytes) into 4 float vectors,
++// in value order: byte i gives value 2i (low nibble) then 2i+1 (high nibble).
++//
++MLAS_FORCEINLINE void
++Unpack16Nibbles(const std::byte* src, VFloat out[4])
++{
++    uint64_t packed;
++    std::memcpy(&packed, src, sizeof(packed));
++
++    const VUChar bytes = reinterpret_cast<VUChar>(vec_splats(packed));
++    const VUChar lo = vec_and(bytes, vec_splats(static_cast<unsigned char>(0x0F)));
++    const VUChar hi = vec_sr(bytes, vec_splats(static_cast<unsigned char>(4)));
++
++    // Interleaving low/high nibbles of bytes 0..7 yields values 0..15 in order.
++    const VUChar values = vec_mergeh(lo, hi);
++
++    // Zero-extend uchar -> ushort -> uint, then convert. On little endian,
++    // merging with zeros is the zero-extension.
++    const VUChar zero_uc = vec_splats(static_cast<unsigned char>(0));
++    const VUShort zero_us = vec_splats(static_cast<unsigned short>(0));
++
++    const VUShort s_lo = reinterpret_cast<VUShort>(vec_mergeh(values, zero_uc));
++    const VUShort s_hi = reinterpret_cast<VUShort>(vec_mergel(values, zero_uc));
++
++    out[0] = vec_ctf(reinterpret_cast<VUInt>(vec_mergeh(s_lo, zero_us)), 0);
++    out[1] = vec_ctf(reinterpret_cast<VUInt>(vec_mergel(s_lo, zero_us)), 0);
++    out[2] = vec_ctf(reinterpret_cast<VUInt>(vec_mergeh(s_hi, zero_us)), 0);
++    out[3] = vec_ctf(reinterpret_cast<VUInt>(vec_mergel(s_hi, zero_us)), 0);
++}
++
+ // Width of the column tile the sgemm kernel expects in its packed B: it loads
+ // 16 consecutive floats per K step (FgemmKernelpower.h loads B, B+4, B+8, B+12).
+ constexpr size_t SgemmPackBWidth = 16;
+@@ -144,9 +185,31 @@ SQ4BitGemmM1Kernel_CompFp32(
+             const std::byte* BlockData = QuantBDataCol + k_blk_idx * BlkDataSize;
+ 
+             const size_t kklen = std::min(CountK - k, BlkLen);
+-            for (size_t kk = 0; kk < kklen; ++kk) {
+-                sum += A[k + kk] * (DequantValue(BlockData, kk) - zp) * scale;
++
++            // The scale is constant across the block, so accumulate
++            // sum(A * (v - zp)) first and scale once at the end.
++            const VFloat zp_v = vec_splats(zp);
++            VFloat acc = vec_splats(0.0f);
++
++            size_t kk = 0;
++            for (; kk + 16 <= kklen; kk += 16) {
++                VFloat vals[4];
++                Unpack16Nibbles(BlockData + kk / 2, vals);
++
++                const float* a = A + k + kk;
++                acc = vec_madd(vec_xl(0, a), vec_sub(vals[0], zp_v), acc);
++                acc = vec_madd(vec_xl(16, a), vec_sub(vals[1], zp_v), acc);
++                acc = vec_madd(vec_xl(32, a), vec_sub(vals[2], zp_v), acc);
++                acc = vec_madd(vec_xl(48, a), vec_sub(vals[3], zp_v), acc);
+             }
++
++            float blk_sum = acc[0] + acc[1] + acc[2] + acc[3];
++
++            for (; kk < kklen; ++kk) {
++                blk_sum += A[k + kk] * (DequantValue(BlockData, kk) - zp);
++            }
++
++            sum += blk_sum * scale;
+         }
+ 
+         C[n] = Bias != nullptr ? sum + Bias[n] : sum;

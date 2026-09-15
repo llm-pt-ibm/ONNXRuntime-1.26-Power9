@@ -1,0 +1,83 @@
+From 7944bd99f4bc76274d28f70c2a85af8316eee03b Mon Sep 17 00:00:00 2001
+From: llm-pt-ibm <llm-pt-ibm@ufcg.edu.br>
+Date: Thu, 6 Aug 2026 20:19:27 +0000
+Subject: [PATCH 4/5] mlas: keep the POWER M1 accumulator in vector form across
+ blocks
+
+Each block ended with a horizontal reduction of the accumulator, per column.
+Models quantized with block_size=32 -- the common case, and what Phi-3-mini
+ships -- only have 8 vectors of work per block, so those four extracts and
+three adds were a large share of the inner loop, and they serialise it.
+
+Fold the block accumulator into a running per-column vector total with a
+single FMA (total = acc * scale + total) instead, and reduce once per column
+at the very end.
+
+MatMulNBits M=1 K=3072 N=8192 peak: 52.1 -> 67.9 GFLOP/s.
+Phi-3-mini int4 end-to-end decoding: 7.89 -> 9.01 tok/s.
+int4 is now 1.5-1.8x of fp32 on the same GEMM, from 25-45x before the port.
+
+23/23 against the NumPy reference, 17/17 numerics, 89/89 genai unit tests.
+---
+ .../lib/power/sqnbitgemm_kernel_power.cpp     | 35 +++++++++++++------
+ 1 file changed, 24 insertions(+), 11 deletions(-)
+
+diff --git a/onnxruntime/core/mlas/lib/power/sqnbitgemm_kernel_power.cpp b/onnxruntime/core/mlas/lib/power/sqnbitgemm_kernel_power.cpp
+index 5b8e680..f086252 100644
+--- a/onnxruntime/core/mlas/lib/power/sqnbitgemm_kernel_power.cpp
++++ b/onnxruntime/core/mlas/lib/power/sqnbitgemm_kernel_power.cpp
+@@ -181,7 +181,17 @@ SQ4BitGemmM1Kernel_CompFp32(
+     // across all of them. A is tiny (K floats) and stays in cache, but with one
+     // column at a time it is still re-read CountN times, and the loads dominate.
+     for (; n + NCols <= CountN; n += NCols) {
+-        VFloat sum_v = vec_splats(0.0f);
++        // Per-column running totals, kept in vector form: a block's accumulator
++        // is folded in with a single FMA (acc * scale + total) instead of being
++        // horizontally reduced. With BlkLen=32 there are only 8 vectors of work
++        // per block, so a per-block horizontal reduce -- four extracts and three
++        // adds on POWER -- was a large share of the cost.
++        VFloat total[NCols];
++        float tail_total[NCols];
++        for (size_t c = 0; c < NCols; ++c) {
++            total[c] = vec_splats(0.0f);
++            tail_total[c] = 0.0f;
++        }
+ 
+         for (size_t k = 0, k_blk_idx = 0; k < CountK; k += BlkLen, ++k_blk_idx) {
+             const size_t kklen = std::min(CountK - k, BlkLen);
+@@ -221,22 +231,25 @@ SQ4BitGemmM1Kernel_CompFp32(
+                 }
+             }
+ 
+-            // Horizontal-reduce each column's accumulator, apply its scale, and
+-            // fold into the running per-column sums.
+-            VFloat blk_sum;
+             for (size_t c = 0; c < NCols; ++c) {
+-                float s = acc[c][0] + acc[c][1] + acc[c][2] + acc[c][3];
+-                for (size_t kt = kk; kt < kklen; ++kt) {
+-                    s += A[k + kt] * (DequantValue(BlockData[c], kt) -
+-                                      vec_extract(zp_v[c], 0));
++                total[c] = vec_madd(acc[c], vec_splats(scale[c]), total[c]);
++
++                // Values past the last full group of 16 (only the final block
++                // when K is not a multiple of BlkLen).
++                if (kk < kklen) {
++                    const float zp = vec_extract(zp_v[c], 0);
++                    float s = 0.0f;
++                    for (size_t kt = kk; kt < kklen; ++kt) {
++                        s += A[k + kt] * (DequantValue(BlockData[c], kt) - zp);
++                    }
++                    tail_total[c] += s * scale[c];
+                 }
+-                blk_sum[c] = s * scale[c];
+             }
+-            sum_v = vec_add(sum_v, blk_sum);
+         }
+ 
+         for (size_t c = 0; c < NCols; ++c) {
+-            C[n + c] = Bias != nullptr ? sum_v[c] + Bias[n + c] : sum_v[c];
++            float sum = total[c][0] + total[c][1] + total[c][2] + total[c][3] + tail_total[c];
++            C[n + c] = Bias != nullptr ? sum + Bias[n + c] : sum;
+         }
+     }
+ 

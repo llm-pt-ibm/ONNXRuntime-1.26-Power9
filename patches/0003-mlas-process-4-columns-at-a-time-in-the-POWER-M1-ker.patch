@@ -1,0 +1,113 @@
+From f1af2c70aa75f8541b8c7497398de2d191dd99ea Mon Sep 17 00:00:00 2001
+From: llm-pt-ibm <llm-pt-ibm@ufcg.edu.br>
+Date: Thu, 6 Aug 2026 20:07:32 +0000
+Subject: [PATCH 3/5] mlas: process 4 columns at a time in the POWER M1 kernel
+
+The kernel walked one column of B at a time, so the A vector was re-loaded
+once per column -- 8192 times for a Phi-3-mini FFN projection. Handling
+NCols=4 together loads each A vector once and reuses it, and the four block
+sums reduce into a single float vector.
+
+MatMulNBits M=1 K=3072 N=3072, GFLOP/s by thread count:
+   16 threads:  36.1 -> 45.0
+  160 threads:  10.5 -> 33.1
+The peak is unchanged (~52 GFLOP/s at N=8192), so the win is at the low and
+mid thread counts where the A loads were a larger share of the work.
+
+Phi-3-mini int4 end-to-end decoding: 7.30 -> 7.89 tok/s.
+
+23/23 against the NumPy reference, 17/17 numerics, 89/89 genai unit tests.
+---
+ .../lib/power/sqnbitgemm_kernel_power.cpp     | 72 ++++++++++++++++++-
+ 1 file changed, 71 insertions(+), 1 deletion(-)
+
+diff --git a/onnxruntime/core/mlas/lib/power/sqnbitgemm_kernel_power.cpp b/onnxruntime/core/mlas/lib/power/sqnbitgemm_kernel_power.cpp
+index a345102..5b8e680 100644
+--- a/onnxruntime/core/mlas/lib/power/sqnbitgemm_kernel_power.cpp
++++ b/onnxruntime/core/mlas/lib/power/sqnbitgemm_kernel_power.cpp
+@@ -85,6 +85,10 @@ Unpack16Nibbles(const std::byte* src, VFloat out[4])
+ // 16 consecutive floats per K step (FgemmKernelpower.h loads B, B+4, B+8, B+12).
+ constexpr size_t SgemmPackBWidth = 16;
+ 
++// Columns processed together in the M=1 kernel. Four fills a float vector, so
++// the per-column block sums reduce into one store.
++constexpr size_t NCols = 4;
++
+ MLAS_FORCEINLINE float
+ DequantZeroPoint(const std::byte* QuantBZeroPointCol, size_t k_blk_idx)
+ {
+@@ -171,7 +175,73 @@ SQ4BitGemmM1Kernel_CompFp32(
+     const size_t StrideQuantBZeroPoint =
+         MlasQNBitZeroPointsForBlksSizeInBytes<BlkBitWidth>(BlockCountK);
+ 
+-    for (size_t n = 0; n < CountN; ++n) {
++    size_t n = 0;
++
++    // Handle NCols columns at a time so each A vector is loaded once and reused
++    // across all of them. A is tiny (K floats) and stays in cache, but with one
++    // column at a time it is still re-read CountN times, and the loads dominate.
++    for (; n + NCols <= CountN; n += NCols) {
++        VFloat sum_v = vec_splats(0.0f);
++
++        for (size_t k = 0, k_blk_idx = 0; k < CountK; k += BlkLen, ++k_blk_idx) {
++            const size_t kklen = std::min(CountK - k, BlkLen);
++
++            const std::byte* BlockData[NCols];
++            VFloat zp_v[NCols];
++            VFloat acc[NCols];
++            float scale[NCols];
++
++            for (size_t c = 0; c < NCols; ++c) {
++                const size_t col = n + c;
++                BlockData[c] = QuantBData + col * StrideQuantBData + k_blk_idx * BlkDataSize;
++                scale[c] = QuantBScale[col * BlockCountK + k_blk_idx];
++                const std::byte* zp_col =
++                    (QuantBZeroPoint == nullptr)
++                        ? nullptr
++                        : QuantBZeroPoint + col * StrideQuantBZeroPoint;
++                zp_v[c] = vec_splats(DequantZeroPoint(zp_col, k_blk_idx));
++                acc[c] = vec_splats(0.0f);
++            }
++
++            size_t kk = 0;
++            for (; kk + 16 <= kklen; kk += 16) {
++                const float* a = A + k + kk;
++                const VFloat a0 = vec_xl(0, a);
++                const VFloat a1 = vec_xl(16, a);
++                const VFloat a2 = vec_xl(32, a);
++                const VFloat a3 = vec_xl(48, a);
++
++                for (size_t c = 0; c < NCols; ++c) {
++                    VFloat vals[4];
++                    Unpack16Nibbles(BlockData[c] + kk / 2, vals);
++                    acc[c] = vec_madd(a0, vec_sub(vals[0], zp_v[c]), acc[c]);
++                    acc[c] = vec_madd(a1, vec_sub(vals[1], zp_v[c]), acc[c]);
++                    acc[c] = vec_madd(a2, vec_sub(vals[2], zp_v[c]), acc[c]);
++                    acc[c] = vec_madd(a3, vec_sub(vals[3], zp_v[c]), acc[c]);
++                }
++            }
++
++            // Horizontal-reduce each column's accumulator, apply its scale, and
++            // fold into the running per-column sums.
++            VFloat blk_sum;
++            for (size_t c = 0; c < NCols; ++c) {
++                float s = acc[c][0] + acc[c][1] + acc[c][2] + acc[c][3];
++                for (size_t kt = kk; kt < kklen; ++kt) {
++                    s += A[k + kt] * (DequantValue(BlockData[c], kt) -
++                                      vec_extract(zp_v[c], 0));
++                }
++                blk_sum[c] = s * scale[c];
++            }
++            sum_v = vec_add(sum_v, blk_sum);
++        }
++
++        for (size_t c = 0; c < NCols; ++c) {
++            C[n + c] = Bias != nullptr ? sum_v[c] + Bias[n + c] : sum_v[c];
++        }
++    }
++
++    // Remaining columns, one at a time.
++    for (; n < CountN; ++n) {
+         const std::byte* QuantBDataCol = QuantBData + n * StrideQuantBData;
+         const float* QuantBScaleCol = QuantBScale + n * BlockCountK;
+         const std::byte* QuantBZeroPointCol =

@@ -1,0 +1,304 @@
+From 1315e3f930ec67f5c6f1b6eba9fd2e79e0fd0498 Mon Sep 17 00:00:00 2001
+From: llm-pt-ibm <llm-pt-ibm@ufcg.edu.br>
+Date: Thu, 6 Aug 2026 19:17:57 +0000
+Subject: [PATCH 1/5] mlas: add SQNBIT_CompFp32 kernels for POWER
+
+QNBitGemmDispatch was registered for AVX2/AVX512/NEON/LASX but never for
+POWER, so MlasIsQNBitGemmAvailable() returned false and MatMulNBits fell
+back to ComputeBUnpacked(), which dequantizes all of B on every call.
+
+Provide the two CompFp32 entry points (M1 kernel and dequant-for-sgemm)
+plus identity packing, which puts POWER on the MLAS path and lets the
+existing POWER9 sgemm kernel do the multiplication.
+
+Measured on POWER9 (Phi-3-mini int4, 3.8B):
+  MatMulNBits M=1 K=3072 N=8192:  3.2 -> 18.4 GFLOP/s
+  end-to-end decoding:            0.51 -> 2.66 tok/s (best thread count)
+                                  0.13 -> 1.49 tok/s (default thread count)
+
+Kernels are scalar for now; the layout contracts are validated against a
+NumPy reference across BlkLen 16/32/64/128, with and without zero points,
+and on tile-edge shapes.
+---
+ cmake/onnxruntime_mlas.cmake                  |   1 +
+ onnxruntime/core/mlas/lib/mlasi.h             |   2 +
+ onnxruntime/core/mlas/lib/platform.cpp        |   4 +
+ .../lib/power/sqnbitgemm_kernel_power.cpp     | 229 ++++++++++++++++++
+ 4 files changed, 236 insertions(+)
+ create mode 100644 onnxruntime/core/mlas/lib/power/sqnbitgemm_kernel_power.cpp
+
+diff --git a/cmake/onnxruntime_mlas.cmake b/cmake/onnxruntime_mlas.cmake
+index 0233254..86921ad 100644
+--- a/cmake/onnxruntime_mlas.cmake
++++ b/cmake/onnxruntime_mlas.cmake
+@@ -605,6 +605,7 @@ else()
+           ${MLAS_SRC_DIR}/dgemm.cpp
+           ${MLAS_SRC_DIR}/power/DgemmKernelPower.cpp
+           ${MLAS_SRC_DIR}/power/QuantizePower.cpp
++          ${MLAS_SRC_DIR}/power/sqnbitgemm_kernel_power.cpp
+         )
+         set_source_files_properties(${MLAS_SRC_DIR}/power/SgemmKernelPower.cpp PROPERTIES COMPILE_FLAGS "-DSINGLE")
+ 
+diff --git a/onnxruntime/core/mlas/lib/mlasi.h b/onnxruntime/core/mlas/lib/mlasi.h
+index 1fa4c90..e8972ab 100644
+--- a/onnxruntime/core/mlas/lib/mlasi.h
++++ b/onnxruntime/core/mlas/lib/mlasi.h
+@@ -1368,6 +1368,8 @@ extern const MLAS_QNBIT_GEMM_DISPATCH MlasSQNBitGemmDispatchAvx512vnni;
+ 
+ extern const MLAS_QNBIT_GEMM_DISPATCH MlasSQNBitGemmDispatchLasx;
+ 
++extern const MLAS_QNBIT_GEMM_DISPATCH MlasQNBitGemmDispatchPower;
++
+ struct MLAS_QNBIT_LUT_GEMM_DISPATCH;
+ 
+ extern const MLAS_QNBIT_LUT_GEMM_DISPATCH MlasLutGenKernelAvx2;
+diff --git a/onnxruntime/core/mlas/lib/platform.cpp b/onnxruntime/core/mlas/lib/platform.cpp
+index 191ee1a..1794b45 100644
+--- a/onnxruntime/core/mlas/lib/platform.cpp
++++ b/onnxruntime/core/mlas/lib/platform.cpp
+@@ -788,6 +788,10 @@ Return Value:
+     this->QuantizeLinearU16Kernel = MlasQuantizeLinearU16Kernel;
+     this->QuantizeLinearS4Kernel = MlasQuantizeLinearS4Kernel;
+     this->QuantizeLinearU4Kernel = MlasQuantizeLinearU4Kernel;
++    // SQNBIT_CompFp32 only: dequantize B and let the POWER sgemm kernel above
++    // do the multiply. Without this, MatMulNBits falls back to the much slower
++    // ComputeBUnpacked() path.
++    this->QNBitGemmDispatch = &MlasQNBitGemmDispatchPower;
+ 
+ #if defined(__linux__)
+     unsigned long hwcap2 = getauxval(AT_HWCAP2);
+diff --git a/onnxruntime/core/mlas/lib/power/sqnbitgemm_kernel_power.cpp b/onnxruntime/core/mlas/lib/power/sqnbitgemm_kernel_power.cpp
+new file mode 100644
+index 0000000..d25794a
+--- /dev/null
++++ b/onnxruntime/core/mlas/lib/power/sqnbitgemm_kernel_power.cpp
+@@ -0,0 +1,229 @@
++/*++
++
++Copyright (c) Microsoft Corporation. All rights reserved.
++
++Licensed under the MIT License.
++
++Module Name:
++
++    sqnbitgemm_kernel_power.cpp
++
++Abstract:
++
++    This module implements the SQNBIT_CompFp32 kernels for POWER.
++
++    MLAS previously registered QNBitGemmDispatch only for AVX2/AVX512/NEON/
++    LASX, so on POWER it stayed null, MlasIsQNBitGemmAvailable() returned
++    false, and MatMulNBits fell back to ComputeBUnpacked() -- which
++    dequantizes the whole of B on every call. Providing the two CompFp32
++    entry points is enough to put POWER on the MLAS path, where the existing
++    POWER9 sgemm kernel (SgemmKernelPower.cpp) does the multiplication.
++
++    B layout consumed here is the unpacked one: quantized values are stored
++    column major in blocks of BlkLen values, two 4-bit values per byte, with
++    value 2i in the low nibble of byte i and value 2i+1 in the high nibble.
++    Packing is the identity (see SQ4BitGemmPackQuantBData below).
++
++--*/
++
++#include <algorithm>
++#include <cassert>
++#include <cstring>
++
++#include "qnbitgemm.h"
++
++namespace sqnbitgemm_power
++{
++
++namespace
++{
++
++constexpr size_t BlkBitWidth = 4;
++
++// Width of the column tile the sgemm kernel expects in its packed B: it loads
++// 16 consecutive floats per K step (FgemmKernelpower.h loads B, B+4, B+8, B+12).
++constexpr size_t SgemmPackBWidth = 16;
++
++MLAS_FORCEINLINE float
++DequantZeroPoint(const std::byte* QuantBZeroPointCol, size_t k_blk_idx)
++{
++    // Zero points are 4 bits each, two per byte, indexed by block.
++    if (QuantBZeroPointCol == nullptr) {
++        return 8.0f;  // implicit zero point
++    }
++    const std::byte packed = QuantBZeroPointCol[k_blk_idx / 2];
++    const std::byte zp = ((k_blk_idx & 1) == 1) ? (packed >> 4) : (packed & std::byte{0x0F});
++    return static_cast<float>(std::to_integer<uint8_t>(zp));
++}
++
++MLAS_FORCEINLINE float
++DequantValue(const std::byte* BlockData, size_t kk)
++{
++    // Value kk lives in byte kk/2: low nibble when kk is even, high nibble when odd.
++    const std::byte b = BlockData[kk / 2];
++    const uint8_t v = ((kk & 1) == 1)
++                          ? std::to_integer<uint8_t>(b >> 4)
++                          : std::to_integer<uint8_t>(b & std::byte{0x0F});
++    return static_cast<float>(v);
++}
++
++}  // namespace
++
++//
++// Packing: the kernels below read the quantized data in its original layout,
++// so packing is a straight copy. It still has to be registered -- MatMulNBits
++// passes packed_b_ as PackedQuantBData unconditionally, and that buffer only
++// exists if PackQuantBDataSize returns non-zero.
++//
++
++size_t
++QNBitGemmPackQuantBDataSize(
++    size_t N,
++    size_t K,
++    size_t BlkLen,
++    bool /*HasZeroPoint*/,
++    MLAS_QNBIT_GEMM_COMPUTE_TYPE /*ComputeType*/,
++    const MLAS_BACKEND_KERNEL_SELECTOR_CONFIG* /*BackendKernelSelectorConfig*/
++)
++{
++    const size_t BlockCountK = MlasDivRoundup(K, BlkLen);
++    return N * BlockCountK * MlasQNBitBlkDataSizeInBytes(BlkBitWidth, BlkLen);
++}
++
++void
++SQ4BitGemmPackQuantBData(
++    size_t N,
++    size_t K,
++    size_t BlkLen,
++    MLAS_QNBIT_GEMM_COMPUTE_TYPE /*ComputeType*/,
++    const std::byte* QuantBDataBegin,
++    std::byte* PackedQuantBDataBegin,
++    MLAS_THREADPOOL* /*ThreadPool*/,
++    const MLAS_BACKEND_KERNEL_SELECTOR_CONFIG* /*BackendKernelSelectorConfig*/
++)
++{
++    const size_t BlockCountK = MlasDivRoundup(K, BlkLen);
++    const size_t Size = N * BlockCountK * MlasQNBitBlkDataSizeInBytes(BlkBitWidth, BlkLen);
++    std::memcpy(PackedQuantBDataBegin, QuantBDataBegin, Size);
++}
++
++//
++// SQNBIT_CompFp32 kernels.
++//
++
++void
++SQ4BitGemmM1Kernel_CompFp32(
++    size_t BlkLen,
++    const float* A,
++    const std::byte* QuantBData,
++    const float* QuantBScale,
++    const std::byte* QuantBZeroPoint,
++    float* C,
++    size_t CountN,
++    size_t CountK,
++    size_t BlockCountK,
++    const float* Bias
++)
++{
++    const size_t BlkDataSize = MlasQNBitBlkDataSizeInBytes(BlkBitWidth, BlkLen);
++    const size_t StrideQuantBData = BlockCountK * BlkDataSize;
++    const size_t StrideQuantBZeroPoint =
++        MlasQNBitZeroPointsForBlksSizeInBytes<BlkBitWidth>(BlockCountK);
++
++    for (size_t n = 0; n < CountN; ++n) {
++        const std::byte* QuantBDataCol = QuantBData + n * StrideQuantBData;
++        const float* QuantBScaleCol = QuantBScale + n * BlockCountK;
++        const std::byte* QuantBZeroPointCol =
++            (QuantBZeroPoint == nullptr) ? nullptr : QuantBZeroPoint + n * StrideQuantBZeroPoint;
++
++        float sum = 0.0f;
++
++        for (size_t k = 0, k_blk_idx = 0; k < CountK; k += BlkLen, ++k_blk_idx) {
++            const float scale = QuantBScaleCol[k_blk_idx];
++            const float zp = DequantZeroPoint(QuantBZeroPointCol, k_blk_idx);
++            const std::byte* BlockData = QuantBDataCol + k_blk_idx * BlkDataSize;
++
++            const size_t kklen = std::min(CountK - k, BlkLen);
++            for (size_t kk = 0; kk < kklen; ++kk) {
++                sum += A[k + kk] * (DequantValue(BlockData, kk) - zp) * scale;
++            }
++        }
++
++        C[n] = Bias != nullptr ? sum + Bias[n] : sum;
++    }
++}
++
++void
++SQ4BitBlkDequantBForSgemm_CompFp32(
++    size_t BlkLen,
++    float* FpData,
++    const std::byte* QuantBData,
++    const float* QuantBScale,
++    const std::byte* QuantBZeroPoint,
++    size_t CountN,
++    size_t CountK,
++    size_t BlockCountK
++)
++{
++    const size_t BlkDataSize = MlasQNBitBlkDataSizeInBytes(BlkBitWidth, BlkLen);
++    const size_t StrideQuantBData = BlockCountK * BlkDataSize;
++    const size_t StrideQuantBZeroPoint =
++        MlasQNBitZeroPointsForBlksSizeInBytes<BlkBitWidth>(BlockCountK);
++
++    float* Dst = FpData;
++
++    // One tile of SgemmPackBWidth columns at a time; within a tile the sgemm
++    // kernel wants, for each k, the SgemmPackBWidth column values contiguous.
++    for (size_t n0 = 0; n0 < CountN; n0 += SgemmPackBWidth) {
++        const size_t ncols = std::min(SgemmPackBWidth, CountN - n0);
++
++        for (size_t k = 0, k_blk_idx = 0; k < CountK; k += BlkLen, ++k_blk_idx) {
++            const size_t kklen = std::min(CountK - k, BlkLen);
++
++            for (size_t nn = 0; nn < SgemmPackBWidth; ++nn) {
++                if (nn >= ncols) {
++                    // Pad the tile so the kernel's fixed-width loads stay valid.
++                    for (size_t kk = 0; kk < kklen; ++kk) {
++                        Dst[kk * SgemmPackBWidth + nn] = 0.0f;
++                    }
++                    continue;
++                }
++
++                const size_t n = n0 + nn;
++                const std::byte* BlockData =
++                    QuantBData + n * StrideQuantBData + k_blk_idx * BlkDataSize;
++                const float scale = QuantBScale[n * BlockCountK + k_blk_idx];
++                const std::byte* QuantBZeroPointCol =
++                    (QuantBZeroPoint == nullptr)
++                        ? nullptr
++                        : QuantBZeroPoint + n * StrideQuantBZeroPoint;
++                const float zp = DequantZeroPoint(QuantBZeroPointCol, k_blk_idx);
++
++                for (size_t kk = 0; kk < kklen; ++kk) {
++                    Dst[kk * SgemmPackBWidth + nn] =
++                        (DequantValue(BlockData, kk) - zp) * scale;
++                }
++            }
++
++            Dst += kklen * SgemmPackBWidth;
++        }
++    }
++}
++
++}  // namespace sqnbitgemm_power
++
++//
++// Dispatch structure.
++//
++
++const MLAS_QNBIT_GEMM_DISPATCH MlasQNBitGemmDispatchPower = []() {
++    MLAS_QNBIT_GEMM_DISPATCH d;
++
++    d.Q4BitGemmPackQuantBDataSize = sqnbitgemm_power::QNBitGemmPackQuantBDataSize;
++    d.SQ4BitGemmPackQuantBData = sqnbitgemm_power::SQ4BitGemmPackQuantBData;
++
++    d.SQ4BitGemmM1Kernel_CompFp32 = sqnbitgemm_power::SQ4BitGemmM1Kernel_CompFp32;
++    d.SQ4BitBlkDequantBForSgemm_CompFp32 = sqnbitgemm_power::SQ4BitBlkDequantBForSgemm_CompFp32;
++
++    return d;
++}();
