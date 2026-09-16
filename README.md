@@ -1,4 +1,7 @@
-# ONNX Runtime 1.26.0 for POWER9 (ppc64le) — with an int4 MLAS kernel
+# ONNX Runtime 1.26.0 for POWER9 (ppc64le)
+
+**CPU** — with an int4 MLAS kernel that upstream does not have.
+**GPU** — CUDA 12.4 on Tesla V100. See [`gpu/`](gpu/).
 
 ONNX Runtime builds on ppc64le out of the box: MLAS has had POWER GEMM and
 quantization kernels for years. What it did **not** have was a kernel for
@@ -99,15 +102,30 @@ Getting the nibble order or the tile layout wrong does not crash — it returns
 plausible, wrong numbers. That is why the NumPy reference was written before any
 optimization.
 
+## GPU (CUDA)
+
+A CUDA build for Tesla V100 (sm_70) also exists, reaching **177.8 tok/s** on the
+same model — 17× the best CPU figure, and **193.5** with `enable_cuda_graph=1`.
+
+It needed three patches, none of them ppc64le-specific: an abseil × nvcc 12.4
+incompatibility, flash attention defaulting on despite requiring sm_80, and an
+undefined `Einsum::DeviceCompute` symbol that makes the CUDA provider fail to
+load — **without breaking the build**, so the runtime silently executes on the
+CPU while still advertising `CUDAExecutionProvider`.
+
+Full write-up, traps and measurements: [`gpu/README.md`](gpu/README.md) and
+[`docs/results-gpu.md`](docs/results-gpu.md).
+
 ## Repository layout
 
 ```
-kernel/       the kernel source, as it lands in mlas/lib/power/
-patches/      the five commits, as git-format-patch files
-build/        build scripts (build, ORT_HOME assembly, progress)
-tests/        correctness: NumPy reference + numerical battery
-benchmarks/   GEMM microbenchmark and end-to-end thread sweep
-docs/         detailed results
+kernel/          the int4 kernel source, as it lands in mlas/lib/power/
+patches/         the five CPU commits, as git-format-patch files
+cpu/build/       build scripts (build, ORT_HOME assembly, progress)
+cpu/tests/       correctness: NumPy reference + numerical battery
+cpu/benchmarks/  GEMM microbenchmark and end-to-end thread sweep
+gpu/             CUDA build scripts, the three patch scripts, tests
+docs/            detailed results, CPU and GPU
 ```
 
 ## Building
@@ -125,7 +143,7 @@ conda create -n onnx_build -c conda-forge python=3.12 "cmake=3.31.*" ninja \
 git clone --recursive -b v1.26.0 https://github.com/microsoft/onnxruntime.git
 cd onnxruntime && git am ../patches/*.patch
 
-bash build/build_ort_cpu_power9.sh
+bash cpu/build/build_ort_cpu_power9.sh
 ```
 
 CMake 4.x removes compatibility with several of ONNX Runtime's pinned
@@ -144,6 +162,9 @@ system libstdc++ (GCC 8 era) is too old.
 - **The prefill kernel is still scalar.** Measured not to be the bottleneck —
   int4 already beats fp32 at M=64 — but it is recorded technical debt.
 - **POWER10 MMA is unused.** The development machine is POWER9.
+- **On the GPU, the int4 kernel is strictly M=1** — the same gap, mirrored.
+  Batch 1 outperforms batch 2 and 4 in total throughput. Writing an `m > 1` int4
+  kernel for sm_70 is the highest-return work left.
 
 Two ideas from the NEON kernel were deliberately not adopted and remain on the
 table: converting int→float by placing the nibble directly into a float
