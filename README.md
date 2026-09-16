@@ -1,7 +1,14 @@
 # ONNX Runtime 1.26.0 for POWER9 (ppc64le)
 
-**CPU** — with an int4 MLAS kernel that upstream does not have.
-**GPU** — CUDA 12.4 on Tesla V100. See [`gpu/`](gpu/).
+Two build tracks, both producing installable wheels for Python 3.12:
+
+| | Package | Phi-3-mini int4 | What it took |
+|---|---|---|---|
+| **CPU** | `onnxruntime` | 10.5 tok/s | an int4 MLAS kernel that upstream does not have |
+| **GPU** | `onnxruntime_gpu` | **177.8** tok/s (193.5 with cuda graph) | three patches, none ppc64le-specific |
+
+They are **separate packages** — install one or the other, not both.
+GPU details in [`gpu/`](gpu/).
 
 ONNX Runtime builds on ppc64le out of the box: MLAS has had POWER GEMM and
 quantization kernels for years. What it did **not** have was a kernel for
@@ -113,6 +120,29 @@ undefined `Einsum::DeviceCompute` symbol that makes the CUDA provider fail to
 load — **without breaking the build**, so the runtime silently executes on the
 CPU while still advertising `CUDAExecutionProvider`.
 
+| | tok/s |
+|---|---|
+| CPU with the int4 kernel, 80 threads | 10.5 |
+| GPU decode | 177.8 |
+| GPU decode, `enable_cuda_graph=1` | **193.5** |
+| GPU prefill | ~208 |
+
+### What runs where
+
+On GPU the work splits between this project and onnxruntime-genai, and knowing
+which is which saves time when something is slow or broken:
+
+| | Where it runs | Fixed for POWER9 by |
+|---|---|---|
+| Transformer layers, GEMMs, attention | **ONNX Runtime CUDA EP** | the three patches here |
+| Sampling, top-k, beam search, KV bookkeeping | genai's own CUDA kernels | nothing — compiled clean |
+| Tokenization, chat template | genai, host side | nothing |
+
+genai is not a thin wrapper: it ships its own `.nv_fatbin` with the generation
+loop, so that sampling does not force a host round-trip on every token. But the
+model itself — everything that dominates the time — is this repository's CUDA
+execution provider.
+
 Full write-up, traps and measurements: [`gpu/README.md`](gpu/README.md) and
 [`docs/results-gpu.md`](docs/results-gpu.md).
 
@@ -151,6 +181,10 @@ dependencies; 3.31 satisfies the 3.28 minimum without breaking them.
 
 The resulting wheel requires a conda-forge `libstdcxx-ng` at runtime — RHEL 8's
 system libstdc++ (GCC 8 era) is too old.
+
+This produces the `onnxruntime` package. The CUDA build produces
+`onnxruntime_gpu` instead — same project, different package name, and they
+conflict if both are installed. See [`gpu/README.md`](gpu/README.md).
 
 ## Status and limitations
 
